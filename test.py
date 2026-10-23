@@ -2,7 +2,7 @@ import time
 import requests
 
 def call_gemini(payload, retries=3):
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=YOUR_API_KEY"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=YOUR_API_KEY"
     for attempt in range(retries):
         resp = requests.post(url, json=payload)
         if resp.status_code == 200:

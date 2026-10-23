@@ -1,15 +1,15 @@
+# Updated for React integration
 import os
 import io
 import uvicorn
 import pandas as pd
-import numpy as np
-import tensorflow as tf
 from PIL import Image
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, auth, firestore
 from google.cloud.firestore_v1.transforms import Sentinel
 from fastapi import FastAPI, File, UploadFile, Request, Depends, HTTPException, status, Query
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -29,8 +29,12 @@ load_dotenv()
 SERVICE_ACCOUNT_FILE = "firebase-adminsdk.json"
 try:
     cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
-    firebase_admin.initialize_app(cred)
-    print("✅ Firebase Admin SDK initialized successfully.")
+    try:
+        firebase_admin.get_app()
+        print("✅ Firebase Admin SDK already initialized.")
+    except ValueError:
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin SDK initialized successfully.")
     db = firestore.client()
     print("✅ Firestore client initialized successfully.")
 except Exception as e:
@@ -39,6 +43,10 @@ except Exception as e:
 
 # --- FastAPI App Initialization ---
 app = FastAPI(title="Farmer's Companion API")
+
+if os.path.exists("frontend/dist"):
+    app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
+
 templates = Jinja2Templates(directory="templates")
 
 # --- Global Variables for Model & Data ---
@@ -105,18 +113,54 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(o
 # --- Model and Data Loading on Startup ---
 @app.on_event("startup")
 async def load_model_and_data():
-    global model, class_names, plant_data_df
+    global class_names, plant_data_df
     try:
-        model_path = os.path.join(os.path.dirname(__file__), 'fine_tuned_model', 'best_fine_tuned_model.keras')
-        model = tf.keras.models.load_model(model_path)
         data_path = os.path.join(os.path.dirname(__file__), 'plant_data.csv')
         plant_data_df = pd.read_csv(data_path)
         class_names.extend(plant_data_df['class_name'].tolist())
-        print("✅ Model and plant data loaded successfully!")
+        print("✅ Plant data loaded successfully!")
     except Exception as e:
         print(f"❌ CRITICAL ERROR during startup: {e}")
 
 # --- UPGRADED AI GURU BRAIN (HELPER FUNCTIONS) ---
+
+# --- Gemini Call Helper with Exponential Backoff ---
+async def call_gemini_with_retry(payload: dict, timeout: int = 60) -> dict:
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY is not configured.")
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    retries = 5
+    delay = 3.0
+    
+    async with httpx.AsyncClient() as client:
+        for attempt in range(retries):
+            try:
+                response = await client.post(api_url, json=payload, timeout=timeout)
+                if response.status_code in [429, 503]:
+                    print(f"⚠️ Gemini API returned {response.status_code}. Retrying in {delay} seconds (attempt {attempt + 1}/{retries})...")
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                if attempt == retries - 1:
+                    raise e
+                if e.response.status_code in [429, 503]:
+                    print(f"⚠️ HTTPStatusError {e.response.status_code}. Retrying in {delay} seconds (attempt {attempt + 1}/{retries})...")
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                else:
+                    raise e
+            except (httpx.RequestError, asyncio.TimeoutError) as e:
+                if attempt == retries - 1:
+                    raise e
+                print(f"⚠️ Request error: {e}. Retrying in {delay} seconds (attempt {attempt + 1}/{retries})...")
+                await asyncio.sleep(delay)
+                delay *= 2
+                
+    raise RuntimeError("Failed to call Gemini API after multiple retries.")
 
 async def generate_ai_workflow(crop_name: str, location_str: str, sowing_date: str) -> dict:
     if not GEMINI_API_KEY: return {"error": "AI key not configured."}
@@ -128,14 +172,10 @@ async def generate_ai_workflow(crop_name: str, location_str: str, sowing_date: s
         "Keep the instructions concise, practical, and easy to understand."
     )
     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(api_url, json=payload, timeout=60)
-            response.raise_for_status()
-            result = response.json()
-            print(f"✅ AI Workflow generated for '{crop_name}' in '{location_str}'.")
-            return json.loads(result['candidates'][0]['content']['parts'][0]['text'])
+        result = await call_gemini_with_retry(payload, timeout=60)
+        print(f"✅ AI Workflow generated for '{crop_name}' in '{location_str}'.")
+        return json.loads(result['candidates'][0]['content']['parts'][0]['text'])
     except Exception as e:
         print(f"❌ Error generating AI workflow: {e}")
         return {"error": "Could not generate an AI farming plan for this crop."}
@@ -150,7 +190,10 @@ async def get_ai_price_trend(user_uid: str, all_plots: list, plot_id: str, crop_
         cached_time = datetime.fromisoformat(target_crop["price_trend_timestamp"])
         if datetime.now() - cached_time < timedelta(hours=24):
             print(f"✅ Using cached price trend for '{crop_name}'.")
-            return target_crop["price_trend_cache"]
+            cached_data = target_crop["price_trend_cache"]
+            if isinstance(cached_data, list):
+                cached_data.sort(key=lambda x: x.get('week', ''))
+            return cached_data
 
     print(f"Fetching new AI Price Trend for '{crop_name}' from API.")
     prompt = (
@@ -160,36 +203,103 @@ async def get_ai_price_trend(user_uid: str, all_plots: list, plot_id: str, crop_
         "Ensure the price fluctuations are realistic for this crop and region."
     )
     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(api_url, json=payload, timeout=45)
-            response.raise_for_status()
-            result = response.json()
-            price_data = json.loads(result['candidates'][0]['content']['parts'][0]['text'])
+        # Take a brief polite pause to separate dashboard calls
+        await asyncio.sleep(1)
+        result = await call_gemini_with_retry(payload, timeout=45)
+        price_data = json.loads(result['candidates'][0]['content']['parts'][0]['text'])
 
-            if db:
-                for plot in all_plots:
-                    if plot.get("id") == plot_id:
-                        for crop in plot.get("crops", []):
-                            if crop.get("crop_id") == crop_id:
-                                crop["price_trend_cache"] = price_data
-                                crop["price_trend_timestamp"] = datetime.now().isoformat()
-                                break
-                doc_ref = db.collection("predictions").document(user_uid)
-                doc_ref.update({"lands": all_plots})
-                print(f"✅ Saved new price trend for '{crop_name}' to cache.")
+        if isinstance(price_data, list):
+            price_data.sort(key=lambda x: x.get('week', ''))
 
-            return price_data
+        if db:
+            for plot in all_plots:
+                if plot.get("id") == plot_id:
+                    for crop in plot.get("crops", []):
+                        if crop.get("crop_id") == crop_id:
+                            crop["price_trend_cache"] = price_data
+                            crop["price_trend_timestamp"] = datetime.now().isoformat()
+                            break
+            doc_ref = db.collection("predictions").document(user_uid)
+            doc_ref.update({"lands": all_plots})
+            print(f"✅ Saved new price trend for '{crop_name}' to cache.")
+
+        return price_data
     except Exception as e:
         print(f"❌ Error generating AI price trend: {e}")
         return []
 
 # --- TRANSPLANTED PREDICTION HELPER FUNCTIONS (FROM YOUR OLD, WORKING CODE) ---
-def preprocess_image(image_bytes: bytes):
-    img = Image.open(io.BytesIO(image_bytes)).resize((256, 256))
-    img_array = np.expand_dims(np.array(img), axis=0) / 255.0
-    return img_array
+# --- Gemini Multimodal Vision Classifier ---
+async def classify_image_with_gemini(image_bytes: bytes, mime_type: str) -> dict:
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="Gemini API Key is not configured.")
+    
+    import base64
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    valid_classes = class_names
+    
+    prompt = (
+        "You are an expert plant pathologist. Analyze this leaf image and classify it into one of these exact categories:\n"
+        f"{valid_classes}\n\n"
+        "Your response MUST be a JSON object with two keys:\n"
+        "1. 'predicted_class': The exact class string from the list above. Choose the most likely category. If healthy, choose the healthy class. If the crop/disease is not listed, select the closest match.\n"
+        "2. 'confidence': A float between 0.0 and 1.0 representing your confidence level.\n\n"
+        "Do not include any other text outside the JSON block."
+    )
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64_image
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+    
+    try:
+        result = await call_gemini_with_retry(payload, timeout=45)
+        
+        if 'usageMetadata' in result:
+            usage = result['usageMetadata']
+            print("\n--- 🧠 AI Image Classifier Token Report ---")
+            print(f"   Prompt Tokens: {usage.get('promptTokenCount', 'N/A')}")
+            print(f"   Response Tokens: {usage.get('candidatesTokenCount', 'N/A')}")
+            print(f"   TOTAL TOKENS USED: {usage.get('totalTokenCount', 'N/A')}")
+            print("-----------------------------------------\n")
+            
+        response_text = result['candidates'][0]['content']['parts'][0]['text']
+        classification_data = json.loads(response_text)
+        
+        predicted_class = classification_data.get('predicted_class')
+        confidence = classification_data.get('confidence', 0.90)
+        
+        if predicted_class not in valid_classes:
+            matched = next((c for c in valid_classes if c.lower() == str(predicted_class).lower()), None)
+            if matched:
+                predicted_class = matched
+            else:
+                print(f"⚠️ Gemini returned invalid class '{predicted_class}'. Defaulting to first class.")
+                predicted_class = valid_classes[0]
+        
+        return {
+            "predicted_class": predicted_class,
+            "confidence": float(confidence)
+        }
+        
+    except Exception as e:
+        print(f"❌ Error during Gemini Image Classification: {e}")
+        raise HTTPException(status_code=500, detail=f"Gemini leaf analysis failed: {e}")
 
 async def get_ai_market_price_estimate(plant_name: str, location_str: str) -> float:
     if not GEMINI_API_KEY:
@@ -205,27 +315,23 @@ async def get_ai_market_price_estimate(plant_name: str, location_str: str) -> fl
     )
     
     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
-    apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
     
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(apiUrl, json=payload, timeout=30)
-            response.raise_for_status()
-            result = response.json()
+        result = await call_gemini_with_retry(payload, timeout=30)
 
-            ## PERMANENT TOKEN USAGE REPORTING
-            if 'usageMetadata' in result:
-                usage = result['usageMetadata']
-                print("\n--- 🧠 AI Price Estimator Token Report ---")
-                print(f"   Prompt Tokens: {usage.get('promptTokenCount', 'N/A')}")
-                print(f"   Response Tokens: {usage.get('candidatesTokenCount', 'N/A')}")
-                print(f"   TOTAL TOKENS USED: {usage.get('totalTokenCount', 'N/A')}")
-                print("-----------------------------------------\n")
+        ## PERMANENT TOKEN USAGE REPORTING
+        if 'usageMetadata' in result:
+            usage = result['usageMetadata']
+            print("\n--- 🧠 AI Price Estimator Token Report ---")
+            print(f"   Prompt Tokens: {usage.get('promptTokenCount', 'N/A')}")
+            print(f"   Response Tokens: {usage.get('candidatesTokenCount', 'N/A')}")
+            print(f"   TOTAL TOKENS USED: {usage.get('totalTokenCount', 'N/A')}")
+            print("-----------------------------------------\n")
 
-            price_data = json.loads(result['candidates'][0]['content']['parts'][0]['text'])
-            price = float(price_data.get("estimated_price_inr", random.uniform(10, 100)))
-            print(f"🧠 AI Price Estimate for {plant_name} in {location_str}: ₹{price:.2f}")
-            return price
+        price_data = json.loads(result['candidates'][0]['content']['parts'][0]['text'])
+        price = float(price_data.get("estimated_price_inr", random.uniform(10, 100)))
+        print(f"🧠 AI Price Estimate for {plant_name} in {location_str}: ₹{price:.2f}")
+        return price
     except Exception as e:
         print(f"❌ Error getting AI price estimate: {e}. Falling back to random price.")
         return random.uniform(10, 100)
@@ -234,45 +340,39 @@ async def get_ai_recommendations(plant_name: str, disease_name: str, impact: str
     if not GEMINI_API_KEY: return {"error": "API key is missing."}
     prompt = f"You are a helpful agricultural expert for a farmer with a {plant_name} plant suffering from {disease_name}. The impact is '{impact}'. Provide a JSON object with three keys: 'harvest_recommendations', 'selling_strategies', and 'bargaining_tips'. Each value should be a brief, clear string."
     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
-    apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(apiUrl, json=payload, timeout=30)
-            response.raise_for_status()
-            result = response.json()
+        result = await call_gemini_with_retry(payload, timeout=30)
 
-            ## PERMANENT TOKEN USAGE REPORTING
-            if 'usageMetadata' in result:
-                usage = result['usageMetadata']
-                print("\n--- 🌿 AI Recommendations Token Report ---")
-                print(f"   Prompt Tokens: {usage.get('promptTokenCount', 'N/A')}")
-                print(f"   Response Tokens: {usage.get('candidatesTokenCount', 'N/A')}")
-                print(f"   TOTAL TOKENS USED: {usage.get('totalTokenCount', 'N/A')}")
-                print("-----------------------------------------\n")
+        ## PERMANENT TOKEN USAGE REPORTING
+        if 'usageMetadata' in result:
+            usage = result['usageMetadata']
+            print("\n--- 🌿 AI Recommendations Token Report ---")
+            print(f"   Prompt Tokens: {usage.get('promptTokenCount', 'N/A')}")
+            print(f"   Response Tokens: {usage.get('candidatesTokenCount', 'N/A')}")
+            print(f"   TOTAL TOKENS USED: {usage.get('totalTokenCount', 'N/A')}")
+            print("-----------------------------------------\n")
 
-            return json.loads(result['candidates'][0]['content']['parts'][0]['text'])
+        return json.loads(result['candidates'][0]['content']['parts'][0]['text'])
     except Exception as e:
         print(f"❌ Error calling Gemini API for recommendations: {e}")
-        return {"error": "Failed to get AI recommendations."}
-
+        return {
+            "harvest_recommendations": "Isolate the crop if possible and follow regular pruning instructions.",
+            "selling_strategies": "Sort quality yields and sell to processing units or direct mandis.",
+            "bargaining_tips": "Highlight size and organic nature of yields to maintain pricing power."
+        }
 # --- HTML PAGE SERVING ROUTES ---
 @app.get("/", response_class=HTMLResponse)
-async def serve_root_as_login(request: Request): return templates.TemplateResponse("index.html", {"request": request})
-
 @app.get("/login", response_class=HTMLResponse)
-async def serve_login_page(request: Request): return templates.TemplateResponse("login.html", {"request": request})
-
 @app.get("/onboarding", response_class=HTMLResponse)
-async def serve_onboarding_page(request: Request): return templates.TemplateResponse("onboarding.html", {"request": request})
-
 @app.get("/dashboard", response_class=HTMLResponse)
-async def serve_dashboard_page(request: Request): return templates.TemplateResponse("dashboard.html", {"request": request})
-
 @app.get("/prediction", response_class=HTMLResponse)
-async def serve_prediction_page(request: Request): return templates.TemplateResponse("prediction.html", {"request": request})
-
 @app.get("/history", response_class=HTMLResponse)
-async def serve_history_page(request: Request): return templates.TemplateResponse("history.html", {"request": request})
+async def serve_react_app(request: Request):
+    index_path = "frontend/dist/index.html"
+    if os.path.exists(index_path):
+        with open(index_path, "r") as f:
+            return HTMLResponse(content=f.read())
+    return templates.TemplateResponse("index.html", {"request": request})
 
 # --- API ENDPOINTS ---
 
@@ -372,9 +472,15 @@ async def handle_onboarding(land_data: LandDataIn, user: dict = Depends(get_curr
         print(f"❌ Error saving new plot for {user_uid}: {e}")
         raise HTTPException(status_code=500, detail="Could not save new plot details.")
 
+dashboard_lock = asyncio.Lock()
+
 @app.get("/api/dashboard-data")
 async def get_dashboard_data(user: dict = Depends(get_current_user), plot_id: Optional[str] = None, crop_id: Optional[str] = None):
     if not db: raise HTTPException(status_code=503, detail="Database service unavailable.")
+    async with dashboard_lock:
+        return await process_dashboard_data(user, plot_id, crop_id)
+
+async def process_dashboard_data(user: dict, plot_id: Optional[str], crop_id: Optional[str]):
     user_uid = user["uid"]
     doc_ref = db.collection("predictions").document(user_uid)
     doc = doc_ref.get()
@@ -406,6 +512,20 @@ async def get_dashboard_data(user: dict = Depends(get_current_user), plot_id: Op
         if target_crop:
             target_crop_id = target_crop.get("crop_id")
             target_crop_name = target_crop.get("crop_name")
+            
+            # Auto-regenerate workflow if missing or contains error from previous API 404 failures
+            current_workflow = target_crop.get("ai_workflow")
+            if not current_workflow or "error" in current_workflow or not isinstance(current_workflow, dict):
+                print(f"🔄 AI Workflow is missing or contains error for '{target_crop_name}'. Regenerating...")
+                sowing_date = target_crop.get("sowing_date") or datetime.now().strftime("%Y-%m-%d")
+                new_workflow = await generate_ai_workflow(target_crop_name, location_str, sowing_date)
+                if "error" not in new_workflow:
+                    target_crop["ai_workflow"] = new_workflow
+                    if db:
+                        doc_ref = db.collection("predictions").document(user_uid)
+                        doc_ref.update({"lands": all_plots})
+                        print(f"✅ Successfully regenerated and saved AI workflow for '{target_crop_name}' to Firestore.")
+
             price_trend_data = await get_ai_price_trend(user_uid, all_plots, target_plot_id, target_crop_id, target_crop_name, location_str)
 
     temp_trend_data, weather_forecast = [], None
@@ -486,10 +606,10 @@ async def get_prediction_history(user: dict = Depends(get_current_user)):
     return JSONResponse(content={"history": []})
 
 
-# --- TRANSPLANTED PREDICT ENDPOINT (FROM YOUR OLD, WORKING CODE) ---
+# --- TRANSPLANTED PREDICT ENDPOINT (UPDATED FOR GEMINI VISION) ---
 @app.post("/predict")
 async def predict_image(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    if not model or plant_data_df is None: raise HTTPException(status_code=503, detail="Model not loaded.")
+    if plant_data_df is None: raise HTTPException(status_code=503, detail="Plant data not loaded.")
     
     user_uid = user["uid"]
     location_str = "India" # Default fallback
@@ -502,11 +622,13 @@ async def predict_image(file: UploadFile = File(...), user: dict = Depends(get_c
                 location_str = first_plot.get("location", {}).get("manual_entry", "India")
 
     image_bytes = await file.read()
-    preprocessed_image = preprocess_image(image_bytes)
-    predictions = model.predict(preprocessed_image)
-    predicted_class_index = np.argmax(predictions[0])
-    predicted_class_name = class_names[predicted_class_index]
-    confidence = float(predictions[0][predicted_class_index])
+    mime_type = file.content_type or "image/jpeg"
+    
+    # Classify image using Gemini Vision API
+    analysis = await classify_image_with_gemini(image_bytes, mime_type)
+    predicted_class_name = analysis["predicted_class"]
+    confidence = analysis["confidence"]
+    
     plant_data = plant_data_df[plant_data_df['class_name'] == predicted_class_name].iloc[0]
     plant_name, disease_name, impact = plant_data['plant_name'], plant_data['disease_name'], plant_data['impact']
     predicted_yield = plant_data['base_yield_kg_per_acre'] * (1 - plant_data['yield_reduction_factor'])
